@@ -1,6 +1,6 @@
 import sqlite3
 from pathlib import Path
-from flask import Flask, g, request, redirect, url_for, flash, render_template_string
+from flask import Flask, g, request, redirect, url_for, flash, render_template_string, session
 import pandas as pd
 import unicodedata
 from jinja2 import DictLoader
@@ -19,6 +19,15 @@ CSV_PATHS = [
 ]
 
 app = Flask(__name__)
+from uuid import uuid4
+from flask import session, g
+
+@app.before_request
+def ensure_user_id():
+    if "user_id" not in session:
+        session["user_id"] = str(uuid4())
+    g.user_id = session["user_id"]
+
 app.secret_key = "change-this-in-production"
 
 # ==========================
@@ -62,6 +71,7 @@ CREATE TABLE IF NOT EXISTS favorites (
     UNIQUE(course_id)
 );
 
+-- 検索高速化
 CREATE INDEX IF NOT EXISTS idx_courses_fac ON courses(開講学部);
 CREATE INDEX IF NOT EXISTS idx_courses_term ON courses(開講時期);
 CREATE INDEX IF NOT EXISTS idx_courses_slot ON courses(曜日時限);
@@ -188,6 +198,7 @@ INDEX_HTML = """
           </select>
         </div>
 
+        <!-- 曜日＋時限（自由入力は削除済み） -->
         <div class="mb-3">
           <label class="form-label">曜日</label>
           <select class="form-select" name="weekday">
@@ -301,14 +312,8 @@ MYPAGE_HTML = """
 # ==========================
 @app.before_request
 def _before():
-    # 毎リクエストでスキーマは確実に存在させる
+    # 毎リクエストでスキーマは確実に存在させる（typo修正：executescript）
     get_db().executescript(SCHEMA_SQL)
-
-@app.before_serving
-def _init_once():
-    # デプロイ直後の最初のリクエストで一度だけCSV→DB投入
-    with app.app_context():
-        init_db_and_seed()
 
 @app.route("/")
 def index():
@@ -318,8 +323,8 @@ def index():
     q       = z2h(request.args.get("q", "").strip())
     faculty = request.args.get("faculty", "").strip()
     term    = request.args.get("term", "").strip()
-    weekday = request.args.get("weekday", "").strip()
-    period  = z2h(request.args.get("period", "").strip())
+    weekday = request.args.get("weekday", "").strip()          # プルダウン（'', '月'..'日'）
+    period  = z2h(request.args.get("period", "").strip())      # 例: '3', '3-4', '3限'
 
     # period の表記ゆれ吸収
     if period.endswith("限"):
@@ -342,6 +347,7 @@ def index():
         where.append("開講時期 = ?")
         params.append(term)
 
+    # 曜日（先頭一致）／時限（部分一致）／両方（AND）
     if weekday:
         where.append("曜日時限 LIKE ?")
         params.append(f"{weekday}%")
@@ -358,7 +364,7 @@ def index():
     courses = list(db.execute(sql, params).fetchall())
 
     # お気に入り判定を付与
-    fav_ids = {r[0] for r in db.execute("SELECT course_id FROM favorites").fetchall()}
+    fav_ids = set(session.get(f"favorites_{g.user_id}", []))
     enriched = []
     for c in courses:
         d = dict(c)
@@ -382,46 +388,49 @@ def index():
 
 @app.route("/favorite/<int:course_id>", methods=["POST"])
 def favorite(course_id):
-    db = get_db()
-    try:
-        db.execute("INSERT OR IGNORE INTO favorites(course_id) VALUES (?)", (course_id,))
-        db.commit()
-        flash("マイページに追加しました。")
-    except Exception as e:
-        flash(f"追加に失敗しました: {e}")
+    key=f"favorites_{g.user_id}"
+    favs = session.get(key, [])
+    if course_id not in favs:
+        favs.append(course_id)
+        session[key] = favs
+    flash("マイページに追加しました。")
     return redirect(request.referrer or url_for("index"))
 
 @app.route("/unfavorite/<int:course_id>", methods=["POST"])
 def unfavorite(course_id):
-    db = get_db()
-    db.execute("DELETE FROM favorites WHERE course_id=?", (course_id,))
-    db.commit()
+    key=f"favorites_{g.user_id}"
+    favs = session.get(key, [])
+    if course_id in favs:
+        favs.remove(course_id)
+        session[key] = favs
     flash("マイページから外しました。")
     return redirect(request.referrer or url_for("mypage"))
 
 @app.route("/bulk-fav", methods=["POST"])
 def bulk_fav():
+    key=f"favorites_{g.user_id}"
     ids = request.form.get("ids", "").strip()
     if not ids:
         flash("講義が選択されていません。")
         return redirect(url_for("index"))
-    id_list = [int(x) for x in ids.split(",") if x.isdigit()]
-    db = get_db()
-    db.executemany("INSERT OR IGNORE INTO favorites(course_id) VALUES (?)", [(i,) for i in id_list])
-    db.commit()
-    flash(f"{len(id_list)}件をマイページに追加しました。")
+    add_ids = [int(x) for x in ids.split(",") if x.isdigit()]
+
+    favs = set(session.get(key, []))
+    before = len(favs)
+    favs.update(add_ids)
+    session[key] = list(favs)
+
+    flash(f"{len(favs)-before}件をマイページに追加しました。")
     return redirect(url_for("mypage"))
 
 @app.route("/mypage")
 def mypage():
-    db = get_db()
-    rows = db.execute(
-        """
-        SELECT c.* FROM courses c
-        JOIN favorites f ON f.course_id = c.id
-        ORDER BY 開講学部, 開講時期, 曜日時限, 講義名
-        """
-    ).fetchall()
+    key=f"favorites_{g.user_id}"
+    favs = session.get(key, [])
+    rows = []
+    if favs:
+        qmarks = ",".join(["?"] * len(favs))
+        rows = get_db().execute(f"SELECT * FROM courses WHERE id IN ({qmarks})", favs).fetchall()
     return render_template_string(
         MYPAGE_HTML,
         title=f"{APP_TITLE}｜マイページ",
@@ -433,11 +442,11 @@ def mypage():
 
 @app.route("/clear-favs", methods=["POST"])
 def clear_favs():
-    db = get_db()
-    db.execute("DELETE FROM favorites")
-    db.commit()
+    key=f"favorites_{g.user_id}"
+    session.pop(key, None)
     flash("マイページを空にしました。")
     return redirect(url_for("mypage"))
+
 
 # ==========================
 # Jinja ローダ登録
@@ -449,11 +458,12 @@ app.jinja_loader = DictLoader({
 })
 
 # ==========================
-# 起動（ローカルのみ）
+# 起動
 # ==========================
 if __name__ == "__main__":
     DATA_DIR.mkdir(exist_ok=True)
     with app.app_context():
         init_db_and_seed()
-    print("== 起動 ==> http://127.0.0.1:5000")
-    app.run(debug=True)
+    print("== 起動 ==>")
+    print("http://127.0.0.1:5000")
+    
