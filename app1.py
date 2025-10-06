@@ -304,7 +304,7 @@ def _before():
     # 毎リクエストでスキーマは確実に存在させる
     get_db().executescript(SCHEMA_SQL)
 
-@app.before_first_request
+@app.before_serving
 def _init_once():
     # デプロイ直後の最初のリクエストで一度だけCSV→DB投入
     with app.app_context():
